@@ -15,7 +15,6 @@ class AlertIn(BaseModel):
 
 
 def _fetch_last_location(child_id: str):
-    """신고한 아이의 마지막 위치를 가져온다 (없으면 None)."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -62,7 +61,6 @@ def create_alert(alert: AlertIn):
 
 @router.get("/list", summary="활성 신고 목록 (보호자용)")
 def list_alerts():
-    """아직 처리되지 않은(active) 위급 신고를 모두 보여준다."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -90,8 +88,13 @@ def list_alerts():
 
 @router.post("/{alert_id}/resolve", summary="신고 처리 완료")
 def resolve_alert(alert_id: int):
-    """보호자가 신고를 확인하면 상태를 'resolved'로 바꾼다."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT id FROM alerts WHERE id = ?", (alert_id,))
-    if
+    if cur.fetchone() is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="해당 신고를 찾을 수 없습니다")
+    cur.execute("UPDATE alerts SET status = 'resolved' WHERE id = ?", (alert_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "신고가 처리되었습니다", "alert_id": alert_id, "status": "resolved"}

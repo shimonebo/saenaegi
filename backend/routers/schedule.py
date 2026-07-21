@@ -9,9 +9,7 @@ from services.database import get_connection
 
 router = APIRouter(prefix="/schedule", tags=["Schedule"])
 
-# 초등학생 평균 보행 속도 (m/분). 나중에 실제 이동기록 평균으로 교체 가능.
 WALK_SPEED_M_PER_MIN = 50.0
-
 DAY_ORDER = {"월": 1, "화": 2, "수": 3, "목": 4, "금": 5, "토": 6, "일": 7}
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
@@ -25,11 +23,10 @@ class ScheduleIn(BaseModel):
     end_name: str
     end_lat: float
     end_lng: float
-    depart_time: str  # "08:00"
+    depart_time: str
 
 
 def _haversine_m(lat1, lng1, lat2, lng2):
-    """두 좌표 사이 실제 거리(미터)."""
     R = 6371000
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -68,10 +65,8 @@ def _row_to_item(r):
 
 @router.post("", summary="아이 귀가 일정 등록")
 def create_schedule(s: ScheduleIn):
-    """일정을 등록하고 예상 소요시간/도착시간을 함께 계산한다."""
     dist = _haversine_m(s.start_lat, s.start_lng, s.end_lat, s.end_lng)
     minutes = _estimate_minutes(dist)
-
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -86,7 +81,6 @@ def create_schedule(s: ScheduleIn):
     schedule_id = cur.lastrowid
     conn.commit()
     conn.close()
-
     return {
         "message": "일정이 등록되었습니다",
         "schedule_id": schedule_id,
@@ -102,7 +96,6 @@ def create_schedule(s: ScheduleIn):
 
 @router.get("/today/{child_id}", summary="오늘 일정 (보호자 홈)")
 def get_today_schedule(child_id: str):
-    """오늘 요일에 해당하는 일정만 보여준다."""
     today = WEEKDAY_KR[datetime.now().weekday()]
     conn = get_connection()
     cur = conn.cursor()
@@ -115,3 +108,32 @@ def get_today_schedule(child_id: str):
     return {
         "child_id": child_id,
         "today": today,
+        "count": len(rows),
+        "schedules": [_row_to_item(r) for r in rows],
+    }
+
+
+@router.get("/{child_id}", summary="특정 아이의 전체 일정")
+def get_schedules(child_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM schedules WHERE child_id = ?", (child_id,))
+    rows = cur.fetchall()
+    conn.close()
+    items = [_row_to_item(r) for r in rows]
+    items.sort(key=lambda x: (DAY_ORDER.get(x["day"], 99), x["depart_time"]))
+    return {"child_id": child_id, "count": len(items), "schedules": items}
+
+
+@router.delete("/{schedule_id}", summary="일정 삭제")
+def delete_schedule(schedule_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM schedules WHERE id = ?", (schedule_id,))
+    if cur.fetchone() is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="해당 일정을 찾을 수 없습니다")
+    cur.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "일정이 삭제되었습니다", "schedule_id": schedule_id}

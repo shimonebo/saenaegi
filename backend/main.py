@@ -46,4 +46,3 @@ async def health_check():
             "demo_scope_ready" if APP_MODE == "demo" else "live_not_ready"
         ),
     }
-PYEOF
