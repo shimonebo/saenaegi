@@ -148,8 +148,8 @@ def get_safe_route(request: RouteRequest):
         data["safe_weight"] = length * (1 + _danger_penalty(ml, mn, zones))
 
     # 4) 출발/도착에서 가장 가까운 도로망 노드 찾기
-    start = ox.nearest_nodes(G, o_lng, o_lat)
-    goal = ox.nearest_nodes(G, d_lng, d_lat)
+    start = ox.distance.nearest_nodes(G, o_lng, o_lat)
+    goal = ox.distance.nearest_nodes(G, d_lng, d_lat)
 
     # 5) 최단경로 & 안전경로 각각 계산
     try:
