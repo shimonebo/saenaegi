@@ -1,11 +1,16 @@
 # backend/routers/route.py
 """
-아동 안전 경로 API (v3 - 캐시 + 가중치 강화 + AI 안전 분석).
+아동 안전 경로 API.
 
-핵심:
-- OSM 도보 도로망에 위험 가중치를 매겨 다익스트라로 안전경로 계산
-- 도로망 캐시로 재요청 시 즉시 응답
-- Claude(ai_analysis)로 경로 위험도 분석 코멘트 부착 (키 없으면 fallback)
+엔드포인트
+- POST /route/plan  : (권장·통합) 출발/도착 '이름'을 받아 지오코딩 → 안전경로 → AI분석까지 한 번에.
+- POST /route/safe  : 좌표를 직접 받아 안전경로만 계산 (기존 호환용).
+- POST /route/driving-test : 카카오 자동차 길찾기 연결 시험.
+
+특징
+- 도로망(OSM) 캐시로 재요청 시 즉시 응답.
+- 위험구간(트램 공사 등)에 가중치를 줘서 안전 경로가 우회하도록 함.
+- osmnx가 없거나 실패해도 데모가 멈추지 않도록 '직선 폴백 경로'를 반환.
 """
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -13,15 +18,17 @@ import math
 
 from config import APP_MODE
 from services.public_data import get_tram_construction_data
-from services.ai_analysis import analyze_route_safety
 from services.kakao_map import (
     KakaoDrivingAPIError,
     get_kakao_driving_route,
+    geocode_place,
+    demo_place_names,
 )
+from services.ai_analysis import analyze_route_safety
 
 router = APIRouter(prefix="/route", tags=["Route"])
 
-# --- 튜닝 파라미터 ---
+# --- 튜닝 파라미터 (발표용: 확실히 우회하도록 세게) ---
 INFLUENCE_M = 200.0
 RISK_WEIGHT = {"고": 20.0, "중": 12.0, "저": 5.0}
 
@@ -32,6 +39,11 @@ _GRAPH_CACHE = {}
 class RouteRequest(BaseModel):
     origin: str = Field(..., description="출발지 '경도,위도'", examples=["127.3760,36.3500"])
     destination: str = Field(..., description="목적지 '경도,위도'", examples=["127.3820,36.3560"])
+
+
+class PlanRequest(BaseModel):
+    start: str = Field(..., description="출발지 이름", examples=["대전서원초등학교"])
+    destination: str = Field(..., description="도착지 이름", examples=["둔산동 보라아파트"])
 
 
 # ---------- 유틸 ----------
@@ -63,145 +75,195 @@ def _danger_penalty(mid_lat, mid_lng, zones):
     return penalty
 
 
-def _path_passes_danger(G, path, zones):
-    for i in range(len(path) - 1):
-        ml = (G.nodes[path[i]]["y"] + G.nodes[path[i + 1]]["y"]) / 2
-        mn = (G.nodes[path[i]]["x"] + G.nodes[path[i + 1]]["x"]) / 2
+def _coords_pass_danger(coords, zones):
+    for i in range(len(coords) - 1):
+        ml = (coords[i]["lat"] + coords[i + 1]["lat"]) / 2
+        mn = (coords[i]["lng"] + coords[i + 1]["lng"]) / 2
         if _danger_penalty(ml, mn, zones) > 0:
             return True
     return False
 
 
-def _min_dist_to_danger(G, path, zones):
+def _coords_min_dist_to_danger(coords, zones):
     m = float("inf")
-    for i in range(len(path) - 1):
-        ml = (G.nodes[path[i]]["y"] + G.nodes[path[i + 1]]["y"]) / 2
-        mn = (G.nodes[path[i]]["x"] + G.nodes[path[i + 1]]["x"]) / 2
+    for i in range(len(coords) - 1):
+        ml = (coords[i]["lat"] + coords[i + 1]["lat"]) / 2
+        mn = (coords[i]["lng"] + coords[i + 1]["lng"]) / 2
         for z in zones:
             m = min(m, _haversine_m(ml, mn, z["lat"], z["lng"]))
     return round(m) if m != float("inf") else None
 
 
-def _path_to_coords(G, path):
-    return [{"lat": G.nodes[n]["y"], "lng": G.nodes[n]["x"]} for n in path]
-
-
-def _path_length_m(G, path):
+def _coords_length_m(coords):
     total = 0.0
-    for i in range(len(path) - 1):
-        total += _haversine_m(
-            G.nodes[path[i]]["y"], G.nodes[path[i]]["x"],
-            G.nodes[path[i + 1]]["y"], G.nodes[path[i + 1]]["x"],
-        )
+    for i in range(len(coords) - 1):
+        total += _haversine_m(coords[i]["lat"], coords[i]["lng"],
+                              coords[i + 1]["lat"], coords[i + 1]["lng"])
     return total
 
 
-def _get_graph(center_lat, center_lng, radius, ox):
-    key = (round(center_lat, 3), round(center_lng, 3), radius)
-    if key in _GRAPH_CACHE:
-        return _GRAPH_CACHE[key], True
-    G = ox.graph_from_point((center_lat, center_lng), dist=radius, network_type="walk")
-    _GRAPH_CACHE[key] = G
-    return G, False
+def _route_block(coords, zones):
+    """경로 좌표 리스트를 프론트가 쓰는 표준 형태로 감싼다."""
+    return {
+        "coords": coords,
+        "distance_m": round(_coords_length_m(coords)),
+        "passes_danger": _coords_pass_danger(coords, zones),
+        "min_dist_to_danger_m": _coords_min_dist_to_danger(coords, zones),
+    }
 
 
-def _build_ai_analysis(safe_route, zones):
-    """경로 정보를 AI 분석에 넘겨 위험도 코멘트를 받는다. 실패해도 경로는 유지."""
-    try:
-        route_info = {
-            "distance_m": safe_route["distance_m"],
-            "passes_danger": safe_route["passes_danger"],
-            "min_dist_to_danger_m": safe_route.get("min_dist_to_danger_m"),
-            "num_waypoints": len(safe_route["coords"]),
-        }
-        return analyze_route_safety(route_info, zones)
-    except Exception:
-        return {
-            "risk_level": "미분석",
-            "ai_comment": "AI 분석을 일시적으로 사용할 수 없습니다. 경로는 정상 제공됩니다.",
-            "mode": "error_fallback",
-        }
+def _get_zones():
+    zones_raw = get_tram_construction_data().get("data", [])
+    return [{"lat": z["lat"], "lng": z["lng"], "risk_level": z.get("risk_level", "중"),
+             "location_name": z.get("location_name", ""), "id": z.get("id")}
+            for z in zones_raw]
 
 
-# ---------- 안전 경로 계산 ----------
-@router.post("/safe", summary="아동 안전 경로 추천 (AI 분석 포함)")
-def get_safe_route(request: RouteRequest):
-    if APP_MODE != "demo":
-        raise HTTPException(status_code=503,
-                            detail={"code": "SAFE_ROUTE_NOT_READY",
-                                    "message": "실제 안전 경로 기능은 준비 중입니다. APP_MODE=demo에서 동작합니다."})
+# ---------- 폴백 경로 (osmnx 없이도 화면이 나오게) ----------
+def _fallback_routes(o_lat, o_lng, d_lat, d_lng, zones):
+    """
+    도로망을 못 쓸 때 쓰는 단순 경로.
+    - 최단: 출발→도착 직선(2점)
+    - 안전: 위험구간 평균 위치의 반대쪽으로 중간점을 밀어 우회하는 3점
+    """
+    shortest = [{"lat": o_lat, "lng": o_lng}, {"lat": d_lat, "lng": d_lng}]
 
-    o_lat, o_lng = _parse_lng_lat(request.origin)
-    d_lat, d_lng = _parse_lng_lat(request.destination)
+    mid_lat, mid_lng = (o_lat + d_lat) / 2, (o_lng + d_lng) / 2
+    if zones:
+        z_lat = sum(z["lat"] for z in zones) / len(zones)
+        z_lng = sum(z["lng"] for z in zones) / len(zones)
+        # 위험구간 반대 방향으로 중간점을 약 250m 정도 이동
+        dlat, dlng = mid_lat - z_lat, mid_lng - z_lng
+        norm = math.hypot(dlat, dlng) or 1.0
+        offset = 0.0025
+        mid_lat += (dlat / norm) * offset
+        mid_lng += (dlng / norm) * offset
+
+    safe = [{"lat": o_lat, "lng": o_lng},
+            {"lat": mid_lat, "lng": mid_lng},
+            {"lat": d_lat, "lng": d_lng}]
+    return shortest, safe
+
+
+# ---------- 안전 경로 계산 (osmnx, 실패 시 폴백) ----------
+def _compute_route(o_lat, o_lng, d_lat, d_lng):
+    zones = _get_zones()
+    engine = "osmnx"
+    cache_hit = False
 
     try:
         import osmnx as ox
         import networkx as nx
-    except ImportError:
-        raise HTTPException(status_code=500,
-                            detail="osmnx/networkx가 설치되어 있지 않습니다. pip install osmnx")
 
-    try:
-        ox.settings.use_cache = True
-        ox.settings.log_console = False
-    except Exception:
-        pass
+        try:
+            ox.settings.use_cache = True
+            ox.settings.log_console = False
+        except Exception:
+            pass
 
-    center_lat = (o_lat + d_lat) / 2
-    center_lng = (o_lng + d_lng) / 2
-    span = _haversine_m(o_lat, o_lng, d_lat, d_lng)
-    radius = max(400, int(span / 2 + 400))
+        center_lat = (o_lat + d_lat) / 2
+        center_lng = (o_lng + d_lng) / 2
+        span = _haversine_m(o_lat, o_lng, d_lat, d_lng)
+        radius = max(400, int(span / 2 + 400))
 
-    try:
-        G, cache_hit = _get_graph(center_lat, center_lng, radius, ox)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"도로망을 가져오지 못했습니다: {e}")
+        key = (round(center_lat, 3), round(center_lng, 3), radius)
+        if key in _GRAPH_CACHE:
+            G, cache_hit = _GRAPH_CACHE[key], True
+        else:
+            G = ox.graph_from_point((center_lat, center_lng), dist=radius, network_type="walk")
+            _GRAPH_CACHE[key] = G
 
-    zones_raw = get_tram_construction_data().get("data", [])
-    zones = [{"lat": z["lat"], "lng": z["lng"], "risk_level": z.get("risk_level", "중")}
-             for z in zones_raw]
+        for u, v, k, data in G.edges(keys=True, data=True):
+            length = data.get("length", 1.0)
+            ml = (G.nodes[u]["y"] + G.nodes[v]["y"]) / 2
+            mn = (G.nodes[u]["x"] + G.nodes[v]["x"]) / 2
+            data["safe_weight"] = length * (1 + _danger_penalty(ml, mn, zones))
 
-    for u, v, k, data in G.edges(keys=True, data=True):
-        length = data.get("length", 1.0)
-        ml = (G.nodes[u]["y"] + G.nodes[v]["y"]) / 2
-        mn = (G.nodes[u]["x"] + G.nodes[v]["x"]) / 2
-        data["safe_weight"] = length * (1 + _danger_penalty(ml, mn, zones))
-
-    start = ox.nearest_nodes(G, o_lng, o_lat)
-    goal = ox.nearest_nodes(G, d_lng, d_lat)
-
-    try:
+        start = ox.nearest_nodes(G, o_lng, o_lat)
+        goal = ox.nearest_nodes(G, d_lng, d_lat)
         path_short = nx.shortest_path(G, start, goal, weight="length")
         path_safe = nx.shortest_path(G, start, goal, weight="safe_weight")
-    except nx.NetworkXNoPath:
-        raise HTTPException(status_code=404, detail="두 지점을 잇는 경로를 찾지 못했습니다.")
 
-    safe_route_data = {
-        "coords": _path_to_coords(G, path_safe),
-        "distance_m": round(_path_length_m(G, path_safe)),
-        "passes_danger": _path_passes_danger(G, path_safe, zones),
-        "min_dist_to_danger_m": _min_dist_to_danger(G, path_safe, zones),
-    }
-    shortest_route_data = {
-        "coords": _path_to_coords(G, path_short),
-        "distance_m": round(_path_length_m(G, path_short)),
-        "passes_danger": _path_passes_danger(G, path_short, zones),
-        "min_dist_to_danger_m": _min_dist_to_danger(G, path_short, zones),
+        short_coords = [{"lat": G.nodes[n]["y"], "lng": G.nodes[n]["x"]} for n in path_short]
+        safe_coords = [{"lat": G.nodes[n]["y"], "lng": G.nodes[n]["x"]} for n in path_safe]
+
+    except Exception:
+        # osmnx 미설치/네트워크 실패/경로없음 등 -> 폴백 경로로 데모 유지
+        engine = "fallback"
+        short_coords, safe_coords = _fallback_routes(o_lat, o_lng, d_lat, d_lng, zones)
+
+    return {
+        "engine": engine,
+        "cache_hit": cache_hit,
+        "danger_zones": zones,
+        "shortest_route": _route_block(short_coords, zones),
+        "safe_route": _route_block(safe_coords, zones),
     }
 
-    ai_result = _build_ai_analysis(safe_route_data, zones)
+
+# ---------- 통합 엔드포인트 (프론트가 쓰는 것) ----------
+@router.post("/plan", summary="[통합] 이름 입력 → 지오코딩 → 안전경로 → AI분석")
+def plan_route(req: PlanRequest):
+    origin = geocode_place(req.start)
+    dest = geocode_place(req.destination)
+    if origin is None or dest is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "GEOCODE_FAILED",
+                "message": "장소를 좌표로 변환하지 못했습니다. (카카오 키가 없으면 데모 지명만 가능)",
+                "supported_demo_places": demo_place_names(),
+            },
+        )
+
+    result = _compute_route(origin["lat"], origin["lng"], dest["lat"], dest["lng"])
+
+    # AI 분석 (실제 경로 정보를 넘겨줌)
+    ai = analyze_route_safety(
+        route_info={
+            "distance_m": result["safe_route"]["distance_m"],
+            "passes_danger": result["safe_route"]["passes_danger"],
+            "min_dist_to_danger_m": result["safe_route"]["min_dist_to_danger_m"],
+            "engine": result["engine"],
+        },
+        danger_zones=get_tram_construction_data().get("data", []),
+    )
+
+    # 위험도(문자) -> 안전점수(숫자)로도 환산해서 화면 게이지에 쓰게 함
+    score_map = {"안전": 92, "주의": 70, "위험": 45}
 
     return {
         "success": True,
         "app_mode": APP_MODE,
-        "cache_hit": cache_hit,
+        "engine": result["engine"],
+        "cache_hit": result["cache_hit"],
+        "start": {"query": req.start, **origin},
+        "destination": {"query": req.destination, **dest},
+        "danger_zones": result["danger_zones"],
+        "shortest_route": result["shortest_route"],
+        "safe_route": result["safe_route"],
+        "ai": ai,
+        "safety_score": score_map.get(ai["risk_level"], 70),
+    }
+
+
+# ---------- 좌표 직접 입력 (기존 호환) ----------
+@router.post("/safe", summary="아동 안전 경로 추천 (좌표 직접 입력)")
+def get_safe_route(request: RouteRequest):
+    o_lat, o_lng = _parse_lng_lat(request.origin)
+    d_lat, d_lng = _parse_lng_lat(request.destination)
+    result = _compute_route(o_lat, o_lng, d_lat, d_lng)
+    return {
+        "success": True,
+        "app_mode": APP_MODE,
+        "engine": result["engine"],
+        "cache_hit": result["cache_hit"],
         "origin": {"lat": o_lat, "lng": o_lng},
         "destination": {"lat": d_lat, "lng": d_lng},
-        "danger_zones": zones,
-        "shortest_route": shortest_route_data,
-        "safe_route": safe_route_data,
-        "ai_analysis": ai_result,
-        "message": "안전 경로와 최단 경로를 함께 반환합니다. 프론트에서 두 경로를 비교해 표시하세요.",
+        "danger_zones": result["danger_zones"],
+        "shortest_route": result["shortest_route"],
+        "safe_route": result["safe_route"],
+        "message": "안전 경로와 최단 경로를 함께 반환합니다.",
     }
 
 

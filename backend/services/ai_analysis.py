@@ -1,71 +1,97 @@
 # backend/services/ai_analysis.py
-import os
+"""
+경로의 위험도를 Claude AI로 분석하는 모듈.
+
+핵심 원칙:
+- 항상 같은 형태로 결과를 돌려준다.
+  { "risk_level": "안전|주의|위험", "ai_comment": "...", "mode": "ai|fallback_mock" }
+- ANTHROPIC_API_KEY 가 없거나 호출이 실패하면, 서버가 죽지 않고
+  규칙 기반(mock) 결과로 자동 대체한다. (해커톤 데모 안정성)
+"""
+import json
 import requests
-from dotenv import load_dotenv
 
-# 환경 변수 로드 (.env에서 ANTHROPIC_API_KEY를 읽어옵니다)
-load_dotenv()
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+from config import ANTHROPIC_API_KEY
 
-def analyze_route_safety(route_info: dict, construction_info: list):
-    """
-    카카오맵 경로 데이터와 트램 공사/위험 지역 데이터를 조합하여 
-    Claude AI를 통해 아동 귀가 경로의 위험도(안전, 주의, 위험)를 분석하는 함수입니다[cite: 1].
-    """
-    # API 키가 설정되지 않은 경우를 대비한 MVP용 안전 장치
-    if not ANTHROPIC_API_KEY:
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+MODEL = "claude-3-5-sonnet-20241022"
+ALLOWED_LEVELS = {"안전", "주의", "위험"}
+
+
+def _rule_based_result(danger_zones: list) -> dict:
+    """API 키가 없거나 실패했을 때 쓰는 간단한 규칙 기반 판단."""
+    levels = [z.get("risk_level") for z in danger_zones]
+    if "고" in levels:
+        return {
+            "risk_level": "위험",
+            "ai_comment": "경로 주변에 위험도가 높은 공사 구간이 있습니다. 보호자 동행을 권장합니다.",
+            "mode": "fallback_mock",
+        }
+    if "중" in levels:
         return {
             "risk_level": "주의",
-            "ai_comment": "경로 내 트램 공사 구간이 포함되어 있습니다. 보호자의 주의가 필요합니다.",
-            "mode": "fallback_mock"
+            "ai_comment": "경로 주변에 공사/정비 구간이 있어 주의가 필요합니다.",
+            "mode": "fallback_mock",
         }
+    return {
+        "risk_level": "안전",
+        "ai_comment": "경로 주변에 특별한 위험 요소가 확인되지 않았습니다.",
+        "mode": "fallback_mock",
+    }
 
-    url = "https://api.anthropic.com/v1/messages"
-    
+
+def analyze_route_safety(route_info: dict, danger_zones: list) -> dict:
+    """
+    경로 정보 + 위험 구간 정보를 받아 아동 귀가 안전도를 분석한다.
+    route_info 예: {"distance_m": 1100, "passes_danger": True, "min_dist_to_danger_m": 40}
+    danger_zones 예: [{"location_name": "...", "risk_level": "고", ...}, ...]
+    """
+    # 키가 없으면 규칙 기반으로 즉시 대체
+    if not ANTHROPIC_API_KEY:
+        return _rule_based_result(danger_zones)
+
+    prompt = (
+        "당신은 초등학생 아동 안심 귀가 서비스의 AI 안전 분석 시스템입니다. "
+        "아래 경로 정보와 대전 지역 위험 구간 정보를 보고 초등학생이 걷기에 안전한지 평가하세요.\n\n"
+        f"[경로 정보]\n{json.dumps(route_info, ensure_ascii=False)}\n\n"
+        f"[위험 구간 정보]\n{json.dumps(danger_zones, ensure_ascii=False)}\n\n"
+        "반드시 아래 JSON 형식으로만 답하세요. 다른 말은 붙이지 마세요.\n"
+        '{"risk_level": "안전|주의|위험 중 하나", "ai_comment": "보호자에게 전달할 한두 문장"}'
+    )
+
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
-        "content-Type": "application/json"
+        "content-type": "application/json",
     }
-    
-    prompt = f"""
-    당신은 초등학생 아동 안심 귀가 서비스 '아이온길'의 AI 안전 분석 시스템입니다[cite: 1].
-    아래의 경로 정보와 대전 트램 공사/위험 지역 데이터를 분석하여, 
-    초등학생이 이동하기에 안전한지 평가하고 보호자에게 전달할 분석 결과를 작성해주세요.
-
-    [경로 정보]
-    {route_info}
-
-    [공사 및 위험 지역 정보]
-    {construction_info}
-
-    결과는 위험도(안전, 주의, 위험 중 하나)와 이해하기 쉬운 안내 코멘트로 구성해 주세요.
-    """
-
     payload = {
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 500,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
+        "model": MODEL,
+        "max_tokens": 400,
+        "messages": [{"role": "user", "content": prompt}],
     }
-    
+
     try:
-        response = requests.post(url, json=payload, headers=headers)
-        if response.status_code == 200:
-            result = response.json()
-            return {
-                "status": "success",
-                "analysis": result["content"][0]["text"]
-            }
-        else:
-            return {
-                "error": "Claude API 호출 실패",
-                "status_code": response.status_code,
-                "detail": response.text
-            }
-    except Exception as e:
+        res = requests.post(ANTHROPIC_URL, json=payload, headers=headers, timeout=15)
+        if res.status_code != 200:
+            return _rule_based_result(danger_zones)
+
+        text = res.json()["content"][0]["text"].strip()
+
+        # Claude가 코드블록(```json ... ```)으로 감쌀 때를 대비해 벗겨낸다
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text[text.find("{"):]
+
+        parsed = json.loads(text[text.find("{"): text.rfind("}") + 1])
+        level = parsed.get("risk_level", "").strip()
+        if level not in ALLOWED_LEVELS:
+            level = "주의"
+
         return {
-            "error": "AI 분석 중 오류 발생",
-            "detail": str(e)
+            "risk_level": level,
+            "ai_comment": parsed.get("ai_comment", "").strip() or "분석 결과를 확인하세요.",
+            "mode": "ai",
         }
+    except Exception:
+        # 네트워크/파싱 등 어떤 오류든 데모가 멈추지 않게 규칙 기반으로 대체
+        return _rule_based_result(danger_zones)

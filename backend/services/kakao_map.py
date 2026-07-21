@@ -240,3 +240,76 @@ def get_kakao_driving_route(
         # 나중에는 지도에 필요한 좌표만 추출하도록 변경합니다.
         "raw_response": response_body,
     }
+
+# ============================================================================
+# 지오코딩(장소 이름 -> 좌표) : 프론트가 "대전서원초등학교" 같은 이름을 보내면
+# 위/경도로 바꿔준다. KAKAO_API_KEY가 있으면 카카오 장소검색을 쓰고,
+# 없으면 아래 데모용 사전으로 대체한다. (해커톤 시연이 키 없이도 되게)
+# ============================================================================
+
+# 데모용 대전 둔산동 일대 주요 지점 (트램 공사구간 주변으로 배치)
+DEMO_PLACES = {
+    "대전서원초등학교": (36.3490, 127.3760),
+    "둔산동 보라아파트": (36.3565, 127.3862),
+    "갤러리아타임월드": (36.3522, 127.3800),
+    "타임월드": (36.3522, 127.3781),
+    "대전정부청사역": (36.3607, 127.3893),
+    "정부청사역": (36.3598, 127.3847),
+    "대전시청": (36.3504, 127.3845),
+    "둔산초등학교": (36.3540, 127.3820),
+}
+
+KAKAO_KEYWORD_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
+
+
+def _geocode_from_demo(query: str):
+    """데모 사전에서 이름으로 좌표를 찾는다. 부분 일치도 허용."""
+    q = query.strip()
+    if q in DEMO_PLACES:
+        lat, lng = DEMO_PLACES[q]
+        return {"name": q, "lat": lat, "lng": lng, "source": "demo_dict"}
+    # 부분 일치(공백 제거 후 포함 관계)
+    q_norm = q.replace(" ", "")
+    for name, (lat, lng) in DEMO_PLACES.items():
+        if q_norm in name.replace(" ", "") or name.replace(" ", "") in q_norm:
+            return {"name": name, "lat": lat, "lng": lng, "source": "demo_dict"}
+    return None
+
+
+def geocode_place(query: str):
+    """
+    장소 이름 -> {"name","lat","lng","source"} 또는 None.
+    1순위: 카카오 장소검색(키 있을 때), 2순위: 데모 사전.
+    """
+    if not query or not query.strip():
+        return None
+
+    # 카카오 키가 있으면 실제 검색 시도
+    if KAKAO_API_KEY:
+        try:
+            res = requests.get(
+                KAKAO_KEYWORD_URL,
+                headers={"Authorization": f"KakaoAK {KAKAO_API_KEY}"},
+                params={"query": query, "size": 1},
+                timeout=8,
+            )
+            if res.status_code == 200:
+                docs = res.json().get("documents", [])
+                if docs:
+                    d = docs[0]
+                    return {
+                        "name": d.get("place_name", query),
+                        "lat": float(d["y"]),
+                        "lng": float(d["x"]),
+                        "source": "kakao",
+                    }
+        except requests.RequestException:
+            pass  # 실패하면 아래 데모 사전으로 넘어감
+
+    # 키가 없거나 검색 실패 -> 데모 사전
+    return _geocode_from_demo(query)
+
+
+def demo_place_names():
+    """지원하는 데모 지명 목록 (사용자 안내용)."""
+    return list(DEMO_PLACES.keys())
