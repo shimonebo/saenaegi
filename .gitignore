@@ -40,6 +40,23 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 .vercel
+# Python cache
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Python virtual environment
+venv/
+.venv/
+backend/venv/
+backend/.venv/
+
+# Python testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local env & database
 .env*
 aiongil.db
