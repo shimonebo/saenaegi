@@ -44,6 +44,7 @@ class RouteRequest(BaseModel):
 class PlanRequest(BaseModel):
     start: str = Field(..., description="출발지 이름", examples=["대전서원초등학교"])
     destination: str = Field(..., description="도착지 이름", examples=["둔산동 보라아파트"])
+    construction: bool = Field(True, description="공사구간(위험지역) 반영 여부. False면 공사 없는 상황으로 계산")
 
 
 # ---------- 유틸 ----------
@@ -112,6 +113,45 @@ def _route_block(coords, zones):
     }
 
 
+def _nearest_node(G, lat, lng):
+    """scikit-learn 없이 위/경도로 가장 가까운 도로 노드를 찾는다."""
+    best, best_d = None, float("inf")
+    for n, data in G.nodes(data=True):
+        d = _haversine_m(lat, lng, data["y"], data["x"])
+        if d < best_d:
+            best_d, best = d, n
+    return best
+
+
+def _path_coords_osmnx(G, path):
+    """노드 경로를 실제 도로 모양(엣지 geometry)을 따라 좌표 리스트로 변환한다.
+    geometry가 없으면 두 노드를 직선으로 잇는다."""
+    coords = []
+    for u, v in zip(path[:-1], path[1:]):
+        edge_dict = G.get_edge_data(u, v)
+        best = None
+        if edge_dict:
+            best = min(edge_dict.values(), key=lambda d: d.get("length", 1.0))
+        if best is not None and best.get("geometry") is not None:
+            xs, ys = best["geometry"].xy
+            pts = [{"lat": y, "lng": x} for x, y in zip(xs, ys)]
+            # geometry가 v->u 방향으로 저장돼 있을 수 있어 u에 가까운 쪽이 앞이 되게 정렬
+            uy, ux = G.nodes[u]["y"], G.nodes[u]["x"]
+            if pts:
+                d0 = abs(pts[0]["lat"] - uy) + abs(pts[0]["lng"] - ux)
+                dN = abs(pts[-1]["lat"] - uy) + abs(pts[-1]["lng"] - ux)
+                if d0 > dN:
+                    pts.reverse()
+            coords.extend(pts[1:] if coords else pts)
+        else:
+            if not coords:
+                coords.append({"lat": G.nodes[u]["y"], "lng": G.nodes[u]["x"]})
+            coords.append({"lat": G.nodes[v]["y"], "lng": G.nodes[v]["x"]})
+    if not coords:
+        coords = [{"lat": G.nodes[n]["y"], "lng": G.nodes[n]["x"]} for n in path]
+    return coords
+
+
 def _get_zones():
     zones_raw = get_tram_construction_data().get("data", [])
     return [{"lat": z["lat"], "lng": z["lng"], "risk_level": z.get("risk_level", "중"),
@@ -146,8 +186,8 @@ def _fallback_routes(o_lat, o_lng, d_lat, d_lng, zones):
 
 
 # ---------- 안전 경로 계산 (osmnx, 실패 시 폴백) ----------
-def _compute_route(o_lat, o_lng, d_lat, d_lng):
-    zones = _get_zones()
+def _compute_route(o_lat, o_lng, d_lat, d_lng, consider_danger=True):
+    zones = _get_zones() if consider_danger else []
     engine = "osmnx"
     cache_hit = False
 
@@ -179,13 +219,14 @@ def _compute_route(o_lat, o_lng, d_lat, d_lng):
             mn = (G.nodes[u]["x"] + G.nodes[v]["x"]) / 2
             data["safe_weight"] = length * (1 + _danger_penalty(ml, mn, zones))
 
-        start = ox.nearest_nodes(G, o_lng, o_lat)
-        goal = ox.nearest_nodes(G, d_lng, d_lat)
+        # scikit-learn 없이 직접 최근접 도로 노드를 찾는다.
+        start = _nearest_node(G, o_lat, o_lng)
+        goal = _nearest_node(G, d_lat, d_lng)
         path_short = nx.shortest_path(G, start, goal, weight="length")
         path_safe = nx.shortest_path(G, start, goal, weight="safe_weight")
 
-        short_coords = [{"lat": G.nodes[n]["y"], "lng": G.nodes[n]["x"]} for n in path_short]
-        safe_coords = [{"lat": G.nodes[n]["y"], "lng": G.nodes[n]["x"]} for n in path_safe]
+        short_coords = _path_coords_osmnx(G, path_short)
+        safe_coords = _path_coords_osmnx(G, path_safe)
 
     except Exception:
         # osmnx 미설치/네트워크 실패/경로없음 등 -> 폴백 경로로 데모 유지
@@ -216,7 +257,7 @@ def plan_route(req: PlanRequest):
             },
         )
 
-    result = _compute_route(origin["lat"], origin["lng"], dest["lat"], dest["lng"])
+    result = _compute_route(origin["lat"], origin["lng"], dest["lat"], dest["lng"], consider_danger=req.construction)
 
     # AI 분석 (실제 경로 정보를 넘겨줌)
     ai = analyze_route_safety(
@@ -226,7 +267,7 @@ def plan_route(req: PlanRequest):
             "min_dist_to_danger_m": result["safe_route"]["min_dist_to_danger_m"],
             "engine": result["engine"],
         },
-        danger_zones=get_tram_construction_data().get("data", []),
+        danger_zones=result["danger_zones"],
     )
 
     # 위험도(문자) -> 안전점수(숫자)로도 환산해서 화면 게이지에 쓰게 함

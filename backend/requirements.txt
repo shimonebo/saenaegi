@@ -2,5 +2,5 @@ fastapi
 uvicorn[standard]
 requests
 python-dotenv
-osmnx==1.9.4
+osmnx
 networkx

@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import KakaoMap from "./KakaoMap";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const WALK_SPEED_M_PER_MIN = 50; // 어린이 도보 속도 가정 (백엔드 스케줄과 동일)
+const WALK_SPEED_M_PER_MIN = 50;
 
 type Coord = { lat: number; lng: number };
 type RouteBlock = {
@@ -31,6 +31,8 @@ export default function RouteResult({ start, destination }: Props) {
   const [data, setData] = useState<PlanResponse | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  // 공사구간 반영 여부 (true=공사 있음, false=공사 없음) — 비교용 토글
+  const [construction, setConstruction] = useState(true);
 
   useEffect(() => {
     let alive = true;
@@ -41,7 +43,7 @@ export default function RouteResult({ start, destination }: Props) {
         const res = await fetch(`${API_URL}/route/plan`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ start, destination }),
+          body: JSON.stringify({ start, destination, construction }),
         });
         if (!res.ok) {
           const body = await res.json().catch(() => ({}));
@@ -62,7 +64,7 @@ export default function RouteResult({ start, destination }: Props) {
     return () => {
       alive = false;
     };
-  }, [start, destination]);
+  }, [start, destination, construction]);
 
   const durationMin = data ? Math.round(data.safe_route.distance_m / WALK_SPEED_M_PER_MIN) : 0;
   const distanceKm = data ? (data.safe_route.distance_m / 1000).toFixed(1) : "0";
@@ -81,7 +83,30 @@ export default function RouteResult({ start, destination }: Props) {
           <p className="text-[10px] font-bold tracking-[0.18em] text-[#566171]">AI SAFE ROUTE</p>
           <h1 className="mt-4 text-4xl leading-tight font-extrabold">안전 경로<br />분석 결과</h1>
 
-          <div className="mt-7 rounded-xl bg-[#1c1f24] p-5">
+          {/* 공사 있음/없음 비교 토글 */}
+          <div className="mt-6">
+            <p className="mb-2 text-xs font-bold text-[#8b96aa]">공사 구간 시뮬레이션</p>
+            <div className="flex gap-2 rounded-xl border border-[#333943] bg-[#0e1012] p-1">
+              <button
+                onClick={() => setConstruction(true)}
+                className={`flex-1 rounded-lg px-3 py-2 text-sm font-bold transition ${
+                  construction ? "bg-[#007afc] text-white" : "text-[#8b96aa] hover:text-white"
+                }`}
+              >
+                공사 있음
+              </button>
+              <button
+                onClick={() => setConstruction(false)}
+                className={`flex-1 rounded-lg px-3 py-2 text-sm font-bold transition ${
+                  !construction ? "bg-[#007afc] text-white" : "text-[#8b96aa] hover:text-white"
+                }`}
+              >
+                공사 없음
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-5 rounded-xl bg-[#1c1f24] p-5">
             <p className="text-xs text-[#8b96aa]">출발지</p>
             <strong className="mt-2 block">{data?.start.name ?? start}</strong>
             <div className="ml-1.5 h-6 border-l border-dashed border-[#566171]" />
@@ -137,7 +162,11 @@ export default function RouteResult({ start, destination }: Props) {
                 <p className="text-sm text-[#a0aaba]">· 안전 경로 위험구간 통과: {data.safe_route.passes_danger ? "있음" : "없음"}</p>
                 <p className="text-sm text-[#a0aaba]">· 최단 경로 위험구간 통과: {data.shortest_route.passes_danger ? "있음" : "없음"}</p>
                 <p className="text-sm text-[#a0aaba]">· 위험구간 최소 접근거리: {data.safe_route.min_dist_to_danger_m ?? "-"}m</p>
-                <p className="mt-3 text-xs text-[#566171]">주변 위험구간 {data.danger_zones.length}곳 반영</p>
+                <p className="mt-3 text-xs text-[#566171]">
+                  {data.danger_zones.length > 0
+                    ? `주변 위험구간 ${data.danger_zones.length}곳 반영`
+                    : "공사 구간 없음 — 최단 경로로 안내"}
+                </p>
               </div>
             </>
           )}
