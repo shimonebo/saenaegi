@@ -1,12 +1,11 @@
 # backend/routers/route.py
 """
-아동 안전 경로 API (v2 - 속도개선 + 가중치 강화).
+아동 안전 경로 API (v3 - 캐시 + 가중치 강화 + AI 안전 분석).
 
-개선점:
-1) 도로망 캐시: 한 번 받아온 OSM 도로망을 메모리에 저장해두고 재사용
-   -> 같은 구역 재요청 시 다운로드 없이 즉시 응답 (시연 안정성 ↑)
-2) 위험 가중치 강화: 위험구간을 확실히 피하도록 벌점/영향반경 상향
-3) 응답 형식은 v1과 동일 (프론트 재연동 영향 없음)
+핵심:
+- OSM 도보 도로망에 위험 가중치를 매겨 다익스트라로 안전경로 계산
+- 도로망 캐시로 재요청 시 즉시 응답
+- Claude(ai_analysis)로 경로 위험도 분석 코멘트 부착 (키 없으면 fallback)
 """
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -14,6 +13,7 @@ import math
 
 from config import APP_MODE
 from services.public_data import get_tram_construction_data
+from services.ai_analysis import analyze_route_safety
 from services.kakao_map import (
     KakaoDrivingAPIError,
     get_kakao_driving_route,
@@ -21,9 +21,9 @@ from services.kakao_map import (
 
 router = APIRouter(prefix="/route", tags=["Route"])
 
-# --- 튜닝 파라미터 (발표용: 확실히 우회하도록 세게) ---
-INFLUENCE_M = 200.0                                  # 위험구간 영향 반경(m)
-RISK_WEIGHT = {"고": 20.0, "중": 12.0, "저": 5.0}     # 위험도별 벌점
+# --- 튜닝 파라미터 ---
+INFLUENCE_M = 200.0
+RISK_WEIGHT = {"고": 20.0, "중": 12.0, "저": 5.0}
 
 # --- 도로망 캐시 (메모리) ---
 _GRAPH_CACHE = {}
@@ -73,7 +73,6 @@ def _path_passes_danger(G, path, zones):
 
 
 def _min_dist_to_danger(G, path, zones):
-    """경로가 위험구간에 가장 가까이 접근한 거리(m). 발표 설명용."""
     m = float("inf")
     for i in range(len(path) - 1):
         ml = (G.nodes[path[i]]["y"] + G.nodes[path[i + 1]]["y"]) / 2
@@ -98,7 +97,6 @@ def _path_length_m(G, path):
 
 
 def _get_graph(center_lat, center_lng, radius, ox):
-    """도로망을 캐시에서 찾고, 없으면 받아서 캐시에 저장."""
     key = (round(center_lat, 3), round(center_lng, 3), radius)
     if key in _GRAPH_CACHE:
         return _GRAPH_CACHE[key], True
@@ -107,8 +105,26 @@ def _get_graph(center_lat, center_lng, radius, ox):
     return G, False
 
 
+def _build_ai_analysis(safe_route, zones):
+    """경로 정보를 AI 분석에 넘겨 위험도 코멘트를 받는다. 실패해도 경로는 유지."""
+    try:
+        route_info = {
+            "distance_m": safe_route["distance_m"],
+            "passes_danger": safe_route["passes_danger"],
+            "min_dist_to_danger_m": safe_route.get("min_dist_to_danger_m"),
+            "num_waypoints": len(safe_route["coords"]),
+        }
+        return analyze_route_safety(route_info, zones)
+    except Exception:
+        return {
+            "risk_level": "미분석",
+            "ai_comment": "AI 분석을 일시적으로 사용할 수 없습니다. 경로는 정상 제공됩니다.",
+            "mode": "error_fallback",
+        }
+
+
 # ---------- 안전 경로 계산 ----------
-@router.post("/safe", summary="아동 안전 경로 추천")
+@router.post("/safe", summary="아동 안전 경로 추천 (AI 분석 포함)")
 def get_safe_route(request: RouteRequest):
     if APP_MODE != "demo":
         raise HTTPException(status_code=503,
@@ -160,6 +176,21 @@ def get_safe_route(request: RouteRequest):
     except nx.NetworkXNoPath:
         raise HTTPException(status_code=404, detail="두 지점을 잇는 경로를 찾지 못했습니다.")
 
+    safe_route_data = {
+        "coords": _path_to_coords(G, path_safe),
+        "distance_m": round(_path_length_m(G, path_safe)),
+        "passes_danger": _path_passes_danger(G, path_safe, zones),
+        "min_dist_to_danger_m": _min_dist_to_danger(G, path_safe, zones),
+    }
+    shortest_route_data = {
+        "coords": _path_to_coords(G, path_short),
+        "distance_m": round(_path_length_m(G, path_short)),
+        "passes_danger": _path_passes_danger(G, path_short, zones),
+        "min_dist_to_danger_m": _min_dist_to_danger(G, path_short, zones),
+    }
+
+    ai_result = _build_ai_analysis(safe_route_data, zones)
+
     return {
         "success": True,
         "app_mode": APP_MODE,
@@ -167,18 +198,9 @@ def get_safe_route(request: RouteRequest):
         "origin": {"lat": o_lat, "lng": o_lng},
         "destination": {"lat": d_lat, "lng": d_lng},
         "danger_zones": zones,
-        "shortest_route": {
-            "coords": _path_to_coords(G, path_short),
-            "distance_m": round(_path_length_m(G, path_short)),
-            "passes_danger": _path_passes_danger(G, path_short, zones),
-            "min_dist_to_danger_m": _min_dist_to_danger(G, path_short, zones),
-        },
-        "safe_route": {
-            "coords": _path_to_coords(G, path_safe),
-            "distance_m": round(_path_length_m(G, path_safe)),
-            "passes_danger": _path_passes_danger(G, path_safe, zones),
-            "min_dist_to_danger_m": _min_dist_to_danger(G, path_safe, zones),
-        },
+        "shortest_route": shortest_route_data,
+        "safe_route": safe_route_data,
+        "ai_analysis": ai_result,
         "message": "안전 경로와 최단 경로를 함께 반환합니다. 프론트에서 두 경로를 비교해 표시하세요.",
     }
 
