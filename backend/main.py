@@ -6,7 +6,7 @@ from config import APP_MODE
 # 한음: 경로 라우터
 from routers import route
 # 현빈: 위치 / 알림 / 스케줄 라우터
-from routers import location, alert, schedule
+from routers import location, alert, schedule, danger
 # 현빈: DB 초기화
 from services.database import init_db
 
@@ -34,6 +34,7 @@ app.include_router(route.router)
 app.include_router(location.router)
 app.include_router(alert.router)
 app.include_router(schedule.router)
+app.include_router(danger.router)
 
 
 @app.get("/", tags=["default"], summary="백엔드 기본 상태 확인")
