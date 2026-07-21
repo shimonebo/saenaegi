@@ -60,3 +60,5 @@ htmlcov/
 # Local env & database
 .env*
 aiongil.db
+backend/cache/
+backend/aiongil.db
