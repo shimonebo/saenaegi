@@ -94,7 +94,109 @@ def _path_length_m(G, path):
             G.nodes[path[i + 1]]["y"], G.nodes[path[i + 1]]["x"],
         )
     return total
+DEMO_START = (36.3500, 127.3760)
+DEMO_END = (36.3560, 127.3820)
 
+DEMO_SHORTEST_ROUTE = [
+    {"lat": 36.3500, "lng": 127.3760},
+    {"lat": 36.3510, "lng": 127.3770},
+    {"lat": 36.3522, "lng": 127.3781},
+    {"lat": 36.3532, "lng": 127.3792},
+    {"lat": 36.3544, "lng": 127.3805},
+    {"lat": 36.3552, "lng": 127.3812},
+    {"lat": 36.3560, "lng": 127.3820},
+]
+
+DEMO_SAFE_ROUTE = [
+    {"lat": 36.3500, "lng": 127.3760},
+    {"lat": 36.3507, "lng": 127.3749},
+    {"lat": 36.3523, "lng": 127.3748},
+    {"lat": 36.3540, "lng": 127.3760},
+    {"lat": 36.3550, "lng": 127.3784},
+    {"lat": 36.3556, "lng": 127.3802},
+    {"lat": 36.3560, "lng": 127.3820},
+]
+
+
+def _same_coordinate(lat, lng, target, tolerance=0.0003):
+    return (
+        abs(lat - target[0]) <= tolerance
+        and abs(lng - target[1]) <= tolerance
+    )
+
+
+def _coordinate_path_length(coords):
+    total = 0.0
+
+    for i in range(len(coords) - 1):
+        total += _haversine_m(
+            coords[i]["lat"],
+            coords[i]["lng"],
+            coords[i + 1]["lat"],
+            coords[i + 1]["lng"],
+        )
+
+    return round(total)
+
+
+def _get_demo_route(o_lat, o_lng, d_lat, d_lng):
+    forward = (
+        _same_coordinate(o_lat, o_lng, DEMO_START)
+        and _same_coordinate(d_lat, d_lng, DEMO_END)
+    )
+
+    reverse = (
+        _same_coordinate(o_lat, o_lng, DEMO_END)
+        and _same_coordinate(d_lat, d_lng, DEMO_START)
+    )
+
+    if not forward and not reverse:
+        return None
+
+    if forward:
+        shortest_route = DEMO_SHORTEST_ROUTE
+        safe_route = DEMO_SAFE_ROUTE
+    else:
+        shortest_route = list(reversed(DEMO_SHORTEST_ROUTE))
+        safe_route = list(reversed(DEMO_SAFE_ROUTE))
+
+    zones_raw = get_tram_construction_data().get("data", [])
+
+    zones = [
+        {
+            "lat": zone["lat"],
+            "lng": zone["lng"],
+            "risk_level": zone.get("risk_level", "중"),
+            "name": zone.get("location_name", "위험 구간"),
+            "description": zone.get("description", ""),
+        }
+        for zone in zones_raw
+    ]
+
+    return {
+        "success": True,
+        "app_mode": APP_MODE,
+        "origin": {
+            "lat": o_lat,
+            "lng": o_lng,
+        },
+        "destination": {
+            "lat": d_lat,
+            "lng": d_lng,
+        },
+        "danger_zones": zones,
+        "shortest_route": {
+            "coords": shortest_route,
+            "distance_m": _coordinate_path_length(shortest_route),
+            "passes_danger": True,
+        },
+        "safe_route": {
+            "coords": safe_route,
+            "distance_m": _coordinate_path_length(safe_route),
+            "passes_danger": False,
+        },
+        "message": "미리 계산된 해커톤 데모 안전 경로입니다.",
+    }
 
 # ---------- 안전 경로 계산 ----------
 @router.post("/safe", summary="아동 안전 경로 추천")
@@ -112,7 +214,15 @@ def get_safe_route(request: RouteRequest):
 
     o_lat, o_lng = _parse_lng_lat(request.origin)
     d_lat, d_lng = _parse_lng_lat(request.destination)
+    demo_result = _get_demo_route(
+        o_lat,
+        o_lng,
+        d_lat,
+        d_lng,
+    )
 
+    if demo_result is not None:
+        return demo_result
     # 무거운 라이브러리는 여기서 import
     try:
         import osmnx as ox
