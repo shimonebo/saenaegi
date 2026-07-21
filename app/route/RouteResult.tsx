@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import KakaoMap from "./KakaoMap";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const WALK_SPEED_M_PER_MIN = 50; // 어린이 도보 속도 가정 (백엔드 스케줄과 동일)
@@ -25,30 +26,6 @@ type PlanResponse = {
 };
 
 type Props = { start: string; destination: string };
-
-// 위/경도 좌표들을 SVG 화면 좌표로 변환하는 함수 (자동 축척 + y축 뒤집기)
-function makeProjector(points: Coord[], w: number, h: number, pad = 40) {
-  const lats = points.map((p) => p.lat);
-  const lngs = points.map((p) => p.lng);
-  const minLat = Math.min(...lats), maxLat = Math.max(...lats);
-  const minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
-  const spanLat = maxLat - minLat || 0.001;
-  const spanLng = maxLng - minLng || 0.001;
-  return (p: Coord) => {
-    const x = pad + ((p.lng - minLng) / spanLng) * (w - pad * 2);
-    const y = pad + (1 - (p.lat - minLat) / spanLat) * (h - pad * 2); // 위도 클수록 위로
-    return { x, y };
-  };
-}
-
-function toPath(coords: Coord[], project: (p: Coord) => { x: number; y: number }) {
-  return coords
-    .map((c, i) => {
-      const { x, y } = project(c);
-      return `${i === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
-    })
-    .join(" ");
-}
 
 export default function RouteResult({ start, destination }: Props) {
   const [data, setData] = useState<PlanResponse | null>(null);
@@ -86,45 +63,6 @@ export default function RouteResult({ start, destination }: Props) {
       alive = false;
     };
   }, [start, destination]);
-
-  const W = 900, H = 720;
-  let mapSvg = null;
-  if (data) {
-    const allPts = [
-      ...data.safe_route.coords,
-      ...data.shortest_route.coords,
-      ...data.danger_zones.map((z) => ({ lat: z.lat, lng: z.lng })),
-    ];
-    const project = makeProjector(allPts, W, H);
-    const s = project(data.safe_route.coords[0]);
-    const g = project(data.safe_route.coords[data.safe_route.coords.length - 1]);
-    mapSvg = (
-      <svg viewBox={`0 0 ${W} ${H}`} className="absolute inset-0 h-full w-full" role="img" aria-label="실제 추천 안전 경로">
-        <rect width={W} height={H} fill="#111419" />
-        {/* 최단 경로 (회색 점선) */}
-        <path d={toPath(data.shortest_route.coords, project)} fill="none" stroke="#596473" strokeWidth={7} strokeDasharray="12 12" strokeLinecap="round" />
-        {/* 안전 경로 (파란 실선) */}
-        <path d={toPath(data.safe_route.coords, project)} fill="none" stroke="#007afc" strokeWidth={11} strokeLinecap="round" strokeLinejoin="round" />
-        {/* 위험구간 (빨간 원 + 영향반경) */}
-        {data.danger_zones.map((z, i) => {
-          const p = project({ lat: z.lat, lng: z.lng });
-          return (
-            <g key={i}>
-              <circle cx={p.x} cy={p.y} r={26} fill="#ef4444" opacity={0.18} />
-              <circle cx={p.x} cy={p.y} r={9} fill="#ef4444" />
-              <text x={p.x} y={p.y - 16} textAnchor="middle" fill="#fca5a5" fontSize={12} fontWeight={700}>
-                위험 {z.risk_level ?? ""}
-              </text>
-            </g>
-          );
-        })}
-        {/* 출발/도착 마커 */}
-        <circle cx={s.x} cy={s.y} r={15} fill="#ffffff" stroke="#007afc" strokeWidth={7} />
-        <circle cx={g.x} cy={g.y} r={17} fill="#007afc" />
-        <circle cx={g.x} cy={g.y} r={5} fill="#ffffff" />
-      </svg>
-    );
-  }
 
   const durationMin = data ? Math.round(data.safe_route.distance_m / WALK_SPEED_M_PER_MIN) : 0;
   const distanceKm = data ? (data.safe_route.distance_m / 1000).toFixed(1) : "0";
@@ -206,15 +144,23 @@ export default function RouteResult({ start, destination }: Props) {
         </aside>
 
         <section className="relative min-h-[650px] overflow-hidden rounded-3xl border border-[#23262d] bg-[#111419]">
-          {mapSvg}
-          {!data && !loading && (
-            <div className="flex h-full items-center justify-center text-[#566171]">지도를 표시할 수 없습니다</div>
+          {data && (
+            <KakaoMap
+              safeCoords={data.safe_route.coords}
+              shortestCoords={data.shortest_route.coords}
+              dangerZones={data.danger_zones}
+            />
           )}
-          <div className="absolute top-5 left-5 rounded-full bg-[#007afc] px-5 py-3 text-sm font-bold">추천 안전 경로</div>
-          <div className="absolute right-5 bottom-5 rounded-xl border border-[#333943] bg-[#15171b]/95 p-5 text-sm leading-7 text-[#a0aaba] backdrop-blur">
+          {!data && (
+            <div className="flex h-full items-center justify-center text-[#566171]">
+              {loading ? "지도를 준비하는 중…" : "지도를 표시할 수 없습니다"}
+            </div>
+          )}
+          <div className="pointer-events-none absolute top-5 left-5 z-10 rounded-full bg-[#007afc] px-5 py-3 text-sm font-bold">추천 안전 경로</div>
+          <div className="pointer-events-none absolute right-5 bottom-5 z-10 rounded-xl border border-[#333943] bg-[#15171b]/95 p-5 text-sm leading-7 text-[#a0aaba] backdrop-blur">
             <p><span className="text-[#007afc]">━</span> 파란 실선: 추천 안전 경로</p>
-            <p><span className="text-[#596473]">┅</span> 회색 점선: 최단 경로</p>
-            <p><span className="text-[#ef4444]">●</span> 빨간 점: 위험 구간</p>
+            <p><span className="text-[#8b96aa]">┅</span> 회색 점선: 최단 경로</p>
+            <p><span className="text-[#ef4444]">●</span> 빨간 원: 위험 구간</p>
           </div>
         </section>
       </section>
