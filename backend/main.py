@@ -1,5 +1,6 @@
 # backend/main.py
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from config import APP_MODE
 
 # 한음: 경로 라우터
@@ -13,6 +14,15 @@ app = FastAPI(
     title="아이온길(Aion-gil) 백엔드",
     version="1.0.0",
     description="AI 아동 안심 귀가 서비스 백엔드 API",
+)
+
+# CORS 설정 - 프론트엔드가 백엔드를 호출할 수 있게 허용 (해커톤용: 전체 허용)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 서버 시작 시 DB 테이블 준비 (위치/알림/스케줄)
